@@ -34,16 +34,95 @@
 # define HWINFO_TYPE SOCK_DGRAM
 #endif   
 
+#if defined(AF_NETLINK)
+
+#include "libnetlink.c"
+#include <linux/rtnetlink.h>
+
+int netlink_cbk(const struct sockaddr_nl *who, struct nlmsghdr *n,
+		void *arg)
+{
+     struct ifinfomsg *ifi = NLMSG_DATA(n);
+     struct rtattr * tb[IFLA_MAX+1];
+     int len = n->nlmsg_len;
+     unsigned m_flag = 0;
+     char *this_interface = NULL;
+
+     if (n->nlmsg_type != RTM_NEWLINK && n->nlmsg_type != RTM_DELLINK)
+	  return 0;
+
+     len -= NLMSG_LENGTH(sizeof(*ifi));
+     if (len < 0)
+	  return -1;
+
+     parse_rtattr(tb, IFLA_MAX, IFLA_RTA(ifi), len);
+     if (tb[IFLA_IFNAME] == NULL) {
+	  fprintf(stderr, "BUG: nil ifname\n");
+	  return -1;
+     }
+
+     if (tb[IFLA_IFNAME])
+	  this_interface = (char*)RTA_DATA(tb[IFLA_IFNAME]);
+
+     if (!this_interface || strcmp(this_interface, interface))
+	  return 0;
+
+     if (tb[IFLA_BROADCAST]) {
+	  addrlen = RTA_PAYLOAD(tb[IFLA_BROADCAST]);
+	  memcpy (brdaddr, RTA_DATA(tb[IFLA_BROADCAST]), addrlen);
+     }
+
+     if (tb[IFLA_ADDRESS]) {
+	  addrlen = RTA_PAYLOAD(tb[IFLA_ADDRESS]);
+	  memcpy (hwaddr, RTA_DATA(tb[IFLA_ADDRESS]), addrlen);
+     }
+     return 0;
+}
+
+
+int do_netlink()
+{
+     struct rtnl_handle rth = { .fd = -1 };
+
+     if (rtnl_open (&rth, 0) < 0) {
+	  logfile(LOG_ERR, "Could not open RTNETLINK socket");
+	  return -1;
+     }
+
+     if (rtnl_wilddump_request(&rth, AF_PACKET, RTM_GETLINK) < 0) {
+	  logfile(LOG_ERR, "Could not request dump from RTNETLINK socket");
+	  return -1;
+     }
+
+     if (rtnl_dump_filter(&rth, netlink_cbk, NULL, NULL, NULL) < 0) {
+	  logfile(LOG_ERR, "Could not request dump from RTNETLINK socket");
+	  return -1;
+     }
+
+     rtnl_close (&rth);
+
+     return 0;
+}
+#endif
+
 int fill_mac_address(void)
 {
     int s;
+
+    addrlen = 6;
+    memset(brdaddr, 0xff, addrlen);
+
+#if defined(AF_NETLINK)
+    if (do_netlink() == 0)
+	 return;
+#endif
 
     if ((s = socket(HWINFO_DOMAIN, HWINFO_TYPE, 0)) == -1) {
         logfile(LOG_ERR, _("Unable to open raw device: [%s]"),
                 strerror(errno));
         return -1;
     }
-#ifdef SIOCGIFHWADDR
+#if defined(SIOCGIFHWADDR)
     {
         struct ifreq ifr;
         
@@ -62,12 +141,15 @@ int fill_mac_address(void)
         switch (ifr.ifr_hwaddr.sa_family) {
         case ARPHRD_ETHER:
         case ARPHRD_IEEE802:
+#ifdef ARPHRD_INFINIBAND
+	case ARPHRD_INFINIBAND:
+#endif
             break;
         default:
             logfile(LOG_ERR, _("Unknown hardware type [%u]"),
                     (unsigned int) ifr.ifr_hwaddr.sa_family);
         }
-        memcpy(hwaddr, &ifr.ifr_hwaddr.sa_data, sizeof hwaddr);
+        memcpy(hwaddr, &ifr.ifr_hwaddr.sa_data, addrlen);
     }
 #elif defined(HAVE_GETIFADDRS)
     {   
@@ -94,7 +176,7 @@ int fill_mac_address(void)
                     return -1;
                 }
                 ea = (struct ether_addr *) LLADDR(sadl);
-                memcpy(hwaddr, ea, sizeof hwaddr);
+                memcpy(hwaddr, ea, addrlen);
                 
                 return 0;
             }
@@ -149,10 +231,9 @@ int fill_mac_address(void)
                     interface);
             return -1;
         }       
-        memcpy(hwaddr, &arpreq.arp_ha.sa_data, sizeof hwaddr);
+        memcpy(hwaddr, &arpreq.arp_ha.sa_data, addrlen);
     }
 #endif
-    
     (void) close(s);    
     
     return 0;

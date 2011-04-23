@@ -6,26 +6,20 @@
 #ifdef WITH_DMALLOC
 # include <dmalloc.h>
 #endif
+#include <net/if_arp.h>
+#include <netpacket/packet.h>
 
 int gratuitous_arp(const int dev_desc_fd)
 {
-    struct ether_header eh;
-    static unsigned char arp[28] = {
-            0x00, 0x01,   /* MAC address type */
-            0x08, 0x00,   /* Protocol address type */
-            0x06, 0x04,   /* MAC address size, protocol address size */
-            0x00, 0x01,   /* OP (1=request, 2=reply) */
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,   /* Sender MAC */
-            0x00, 0x00, 0x00, 0x00,               /* Sender IP */
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff,   /* Target MAC */
-            0xff, 0xff, 0xff, 0xff                /* Target IP */
-    };    
-    unsigned char *pkt;
+    static unsigned char pkt[60];
+    int pktlen;
+    struct arphdr *arphdr = NULL;
     int rc;
+    char sockaddr_ll_bytes[32] = {0, };
+    struct sockaddr_ll *sll;
+    int slen = 0;
 
-    if (ETHER_ADDR_LEN > 6) {
-	abort();
-    }
+    arphdr = (struct arphdr *) pkt;
 
     /*
      * - Gratuitous ARPs should use requests for the highest interoperability.
@@ -35,33 +29,35 @@ int gratuitous_arp(const int dev_desc_fd)
      * http://ettercap.sourceforge.net/forum/viewtopic.php?t=2392
      * http://wiki.ethereal.com/Gratuitous_ARP
      */
-    arp[7] = 0x01;                                 /* request op */
-    memcpy(&arp[8], hwaddr, sizeof hwaddr);        /* Sender MAC */
-    memcpy(&arp[14], &vaddr.s_addr, (size_t) 4U);  /* Sender IP */
-    memcpy(&arp[18], hwaddr, sizeof hwaddr);       /* Target MAC */
-    memcpy(&arp[24], &vaddr.s_addr, (size_t) 4U);  /* Target IP */
+    arphdr->ar_hrd  = htons (hwtype);
+    arphdr->ar_pro  = htons (ETH_P_IP);
+    arphdr->ar_hln  = addrlen;
+    arphdr->ar_pln  = 4;
+    arphdr->ar_op   = htons (ARPOP_REQUEST);
 
-    memset(&eh, 0, sizeof eh);
-    memcpy(&eh.ether_shost, hwaddr, sizeof hwaddr);
-    memset(&eh.ether_dhost, 0xff, ETHER_ADDR_LEN);
-    eh.ether_type = htons(ETHERTYPE_ARP);
+    memcpy(&pkt[8], hwaddr, addrlen);                          /* Sender MAC */
+    memcpy(&pkt[8+addrlen], &vaddr.s_addr, (size_t) 4U);       /* Sender IP */
+    memcpy(&pkt[12+addrlen], hwaddr, addrlen);                 /* Target MAC */
+    memcpy(&pkt[12+(addrlen*2)], &vaddr.s_addr, (size_t) 4U);  /* Target IP */
 
-    if ((pkt = ALLOCA(sizeof eh + sizeof arp)) == NULL) {
-        logfile(LOG_ERR, _("out of memory to send gratuitous ARP"));
-        return -1;
-    }
-    memcpy(pkt, &eh, sizeof eh);
-    memcpy(pkt + sizeof eh, arp, sizeof arp);
+    pktlen = sizeof (*arphdr) + (2 * 4) + (2 * addrlen);
+
+    sll = (struct sockaddr_ll *)sockaddr_ll_bytes;
+    sll->sll_family = PF_PACKET;
+    sll->sll_protocol = htons (ETH_P_ARP);
+    sll->sll_ifindex = ifindex;
+    sll->sll_halen = addrlen;
+
+    memcpy (sll->sll_addr, brdaddr, addrlen);
+    slen = (addrlen > 8 ? (sizeof (*sll) - 8 + addrlen) : sizeof (*sll));
 
     do {
-	rc = write(dev_desc_fd, pkt, sizeof eh + sizeof arp);
+	 rc = sendto (dev_desc_fd, pkt, pktlen, 0, sll, slen);
     } while (rc < 0 && errno == EINTR);
     if (rc < 0) {
         logfile(LOG_ERR, _("write() in garp: %s"), strerror(errno));
-        ALLOCA_FREE(pkt);
         return -1;
     }
-    ALLOCA_FREE(pkt);
     
     return 0;
 }

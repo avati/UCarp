@@ -33,7 +33,9 @@ ucarp_SOURCES = \
 	log.h \
 	daemonize.c \
 	daemonize.h \
-	syslognames.h
+	syslognames.h \
+	libnetlink.c \
+	libnetlink.h
 
 ucarp_LDADD = \
 	$(LTLIBINTL)

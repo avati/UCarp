@@ -48,6 +48,8 @@
 # include <dmalloc.h>
 #endif
 
+#include <netpacket/packet.h>
+
 static void carp_set_state(struct carp_softc *sc, int state)
 {
     if ((int) sc->sc_state == state) {
@@ -182,17 +184,18 @@ int carp_prepare_ad(struct carp_header *ch, struct carp_softc *sc)
 static void carp_send_ad(struct carp_softc *sc)
 {
     struct carp_header ch;
-    struct ether_header eh;
     struct timeval tv;
     struct ip ip;
     unsigned char *ip_ptr;
     unsigned char *pkt;
     unsigned short sum;    
     size_t ip_len;
-    size_t eth_len;
     int advbase;
     int advskew;
     int rc;
+    char sockaddr_ll_bytes[32] = {0, };
+    struct sockaddr_ll *sll;
+    int slen = 0;
 
 #ifdef DEBUG
     logfile(LOG_DEBUG, "-> carp_send_ad()");
@@ -217,8 +220,7 @@ static void carp_send_ad(struct carp_softc *sc)
     ch.carp_cksum = 0;
 
     ip_len = sizeof ip + sizeof ch;
-    eth_len = ip_len + sizeof eh;
-    if ((pkt = ALLOCA(eth_len)) == NULL) {
+    if ((pkt = ALLOCA(ip_len)) == NULL) {
         logfile(LOG_ERR, _("Out of memory to create packet"));
         sc->sc_ad_tmo.tv_sec = now.tv_sec + tv.tv_sec;
         sc->sc_ad_tmo.tv_usec = now.tv_usec + tv.tv_usec;            
@@ -247,41 +249,25 @@ static void carp_send_ad(struct carp_softc *sc)
     sum = cksum(&ch, sizeof ch);
     ch.carp_cksum = htons(sum);    
     
-    eh.ether_shost[0] = 0x00;
-    eh.ether_shost[1] = 0x00;
-    eh.ether_shost[2] = 0x5e;
-    eh.ether_shost[3] = 0x00;
-    eh.ether_shost[4] = 0x00;
-    eh.ether_shost[5] = vhid;
-    
-    if (no_mcast) {
-        eh.ether_dhost[0] = 0xff;
-        eh.ether_dhost[1] = 0xff;
-        eh.ether_dhost[2] = 0xff;
-        eh.ether_dhost[3] = 0xff;
-        eh.ether_dhost[4] = 0xff;
-        eh.ether_dhost[5] = 0xff;        
-    } else {
-        eh.ether_dhost[0] = 0x01;
-        eh.ether_dhost[1] = 0x00;
-        eh.ether_dhost[2] = 0x5e;
-        eh.ether_dhost[3] = 0x00;
-        eh.ether_dhost[4] = 0x00;
-        eh.ether_dhost[5] = 0x12;        
-    }    
-    eh.ether_type = htons(ETHERTYPE_IP);    
-    
-    memcpy(pkt, &eh, sizeof eh);
-    memcpy(pkt + sizeof eh, &ip, sizeof ip);
-    memcpy(pkt + sizeof ip + sizeof eh, &ch, sizeof ch);
+    memcpy(pkt, &ip, sizeof ip);
+    memcpy(pkt + sizeof ip, &ch, sizeof ch);
 
-    ip_ptr = pkt + sizeof eh;
+    ip_ptr = pkt;
     sum = cksum(ip_ptr, ip_len);
     ip_ptr[offsetof(struct ip, ip_sum)] = (sum >> 8) & 0xff;
     ip_ptr[offsetof(struct ip, ip_sum) + 1] = sum & 0xff;
 
+    sll = (struct sockaddr_ll *)sockaddr_ll_bytes;
+    sll->sll_family = PF_PACKET;
+    sll->sll_protocol = htons (ETH_P_IP);
+    sll->sll_ifindex = ifindex;
+    sll->sll_halen = addrlen;
+
+    memcpy (sll->sll_addr, brdaddr, addrlen);
+    slen = (addrlen > 8 ? (sizeof (*sll) - 8 + addrlen) : sizeof (*sll));
+
     do {
-        rc = write(dev_desc_fd, pkt, eth_len);
+        rc = sendto(dev_desc_fd, pkt, ip_len, 0, (struct sockaddr *)sll, slen);
     } while (rc < 0 && errno == EINTR);
     if (rc < 0) {
         logfile(LOG_WARNING, _("write() has failed: %s"), strerror(errno));
@@ -416,7 +402,6 @@ static void packethandler(unsigned char *dummy,
                           const struct pcap_pkthdr *header,
                           const unsigned char *sp)
 {
-    struct ether_header etherhead;
     struct ip iphead;
     unsigned int source;
     unsigned int dest;
@@ -425,30 +410,8 @@ static void packethandler(unsigned char *dummy,
     unsigned int ip_len;
             
     (void) dummy;
-    if (header->caplen <= (sizeof etherhead + sizeof iphead)) {
-        return;
-    }    
-    memcpy(&etherhead, sp, sizeof etherhead);
-#ifdef DEBUG
-    logfile(LOG_DEBUG, "Ethernet "
-             "[%02x:%02x:%02x:%02x:%02x:%02x]->[%02x:%02x:%02x:%02x:%02x:%02x] "
-             "type [%04x]",
-            (unsigned int) etherhead.ether_shost[0],
-            (unsigned int) etherhead.ether_shost[1],
-            (unsigned int) etherhead.ether_shost[2],
-            (unsigned int) etherhead.ether_shost[3],
-            (unsigned int) etherhead.ether_shost[4],
-            (unsigned int) etherhead.ether_shost[5],
-            (unsigned int) etherhead.ether_dhost[0],
-            (unsigned int) etherhead.ether_dhost[1],
-            (unsigned int) etherhead.ether_dhost[2],
-            (unsigned int) etherhead.ether_dhost[3],
-            (unsigned int) etherhead.ether_dhost[4],
-            (unsigned int) etherhead.ether_dhost[5],
-            (unsigned int) ntohs(etherhead.ether_type));
-#endif
-    sp += sizeof etherhead;
-    caplen = header->caplen - sizeof etherhead;
+
+    sp += 16;
     memcpy(&iphead, sp, sizeof iphead);    
     if (iphead.ip_src.s_addr == srcip.s_addr) {
         return;
@@ -677,6 +640,40 @@ RETSIGTYPE sighandler_usr(const int sig)
     }
 }
 
+int bind_fd_to_interface(int dev_desc_fd, char *interface)
+{
+     struct ifreq ifr;
+     struct sockaddr_ll sll;
+     int slen = sizeof (sll);
+
+     memset(&ifr, 0, sizeof(ifr));
+     strncpy(ifr.ifr_name, interface, IFNAMSIZ-1);
+     if (ioctl(dev_desc_fd, SIOCGIFINDEX, &ifr) < 0) {
+          logfile(LOG_ERR, "Could not get interface index for: %s [%s]",
+                  strerror(errno), interface);
+          return -1;
+     }
+     ifindex = ifr.ifr_ifindex;
+
+     sll.sll_family = AF_PACKET;
+     sll.sll_ifindex = ifindex;
+     sll.sll_protocol = htons (ETH_P_IP);
+
+     if (bind(dev_desc_fd, (struct sockaddr *)&sll, sizeof sll) < 0) {
+          logfile (LOG_ERR, "Could not bind to device: %s [%s]",
+                   strerror(errno), interface);
+          return -1;
+     }
+     if (getsockname(dev_desc_fd, (struct sockaddr *)&sll, &slen) < 0) {
+	  logfile(LOG_ERR, "Could not get interface details: %s [%s]",
+		  strerror(errno), interface);
+	  return -1;
+     }
+     hwtype = sll.sll_hatype;
+     addrlen = sll.sll_halen;
+     return 0;
+}
+
 char *build_bpf_rule(void)
 {
     static char rule[256];
@@ -695,6 +692,20 @@ char *build_bpf_rule(void)
     return rule;
 }
 
+int mac_print(char *mac_str, int mac_str_size, unsigned char *mac, int size)
+{
+     char *ptr = mac_str;
+     int   i = 0;
+
+     for (i=0; i<size; i++) {
+	  if (!i)
+	       ptr += sprintf (ptr, "%02x", mac[i]);
+	  else
+	       ptr += sprintf (ptr, ":%02x", mac[i]);
+     }
+}
+
+
 int docarp(void)
 {
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -707,6 +718,7 @@ int docarp(void)
     int iface_running = 1;
     int poll_sleep_time;
     struct timeval time_until_advert;
+    char mac_str[128];
 
     sc.sc_vhid = vhid;
     sc.sc_advbase = advbase;
@@ -738,12 +750,10 @@ int docarp(void)
                 interface == NULL ? "-" : interface);
         return -1;
     }
-    logfile(LOG_INFO, _("Local advertised ethernet address is "
-                        "[%02x:%02x:%02x:%02x:%02x:%02x]"),
-            (unsigned int) hwaddr[0], (unsigned int) hwaddr[1],
-            (unsigned int) hwaddr[2], (unsigned int) hwaddr[3],
-            (unsigned int) hwaddr[4], (unsigned int) hwaddr[5]);
-    if ((dev_desc = pcap_open_live(interface, ETHERNET_MTU, 0,
+    mac_print(mac_str, 128, hwaddr, addrlen);
+    logfile(LOG_INFO, _("Local advertised ethernet address is [%s]"),
+	    mac_str);
+    if ((dev_desc = pcap_open_live("any", ETHERNET_MTU, 0,
                                    CAPTURE_TIMEOUT, errbuf)) == NULL) {
         logfile(LOG_ERR, _("Unable to open interface [%s]: %s"),
                 interface == NULL ? "-" : interface, errbuf);
@@ -757,6 +767,10 @@ int docarp(void)
     }
     pcap_setfilter(dev_desc, &bpfp);
     dev_desc_fd = pcap_fileno(dev_desc);
+    if (bind_fd_to_interface (dev_desc_fd, interface) != 0) {
+         logfile(LOG_ERR, _("Unable to bind fd to device: %s [%s]"),
+                 strerror (errno), interface);
+    }
     pfds[0].fd = dev_desc_fd;
     pfds[0].events = POLLIN | POLLERR | POLLHUP;
     
